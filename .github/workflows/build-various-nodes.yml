@@ -52,12 +52,12 @@ jobs:
 
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/download-artifact@v2
+      - uses: actions/download-artifact@v4
         with:
           name: my-app-${{ matrix.os }}-${{ matrix.node }}
           path: downloaded-content
       - run: |
           ls downloaded-content
-      - uses: geekyeggo/delete-artifact@v3
+      - uses: geekyeggo/delete-artifact@v4
         with:
             name: my-app-${{ matrix.os }}-${{ matrix.node }}
