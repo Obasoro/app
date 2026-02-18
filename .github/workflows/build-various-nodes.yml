@@ -15,29 +15,21 @@ jobs:
     steps:
     - name: checkout code
       uses: actions/checkout@v4
-    - name: Restore Cache
-      id: cache
-      uses: actions/cache@v4
-      with:
-        path: ~/.npm
-        key: ${{ runner.os }}-npm-${{ matrix.node }}-${{ hashFiles('**/package-lock.json') }}
-        restore-keys: |
-          ${{ runner.os }}-npm-${{ matrix.node }}
+
     - name: Use Node.js ${{ matrix.node }}
       uses: actions/setup-node@v4
       with:
         node-version: ${{ matrix.node }}
-        cache: 'npm'
-    - name: run build
+        cache: 'npm' # This replaces the manual cache@v4 steps entirely
+
+    - name: Install dependencies
       run: npm ci
-    - run: npm run build --if-present    
-    - name: Save Cache    
-      if: steps.cache.outputs.cache-hit != 'true'
-      uses: actions/cache@v3
-      with:
-        path: ~/.npm
-        key: ${{ runner.os }}-npm-${{ matrix.node }}-${{ hashFiles('**/package-lock.json') }}
-    - uses: actions/upload-artifact@v4
+
+    - name: Run build
+      run: npm run build --if-present    
+
+    - name: Upload Build Artifact
+      uses: actions/upload-artifact@v4
       with:
         name: my-app-${{ matrix.os }}-${{ matrix.node }}
         path: dist/
@@ -52,12 +44,18 @@ jobs:
 
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/download-artifact@v4
+      - name: Download Artifact
+        uses: actions/download-artifact@v4
         with:
           name: my-app-${{ matrix.os }}-${{ matrix.node }}
           path: downloaded-content
-      - run: |
-          ls downloaded-content
-      - uses: geekyeggo/delete-artifact@v4
+
+      - name: List files
+        run: ls -R downloaded-content
+
+      # Add your actual deployment commands here (e.g., S3 sync, SSH, etc.)
+
+      - name: Cleanup Artifact
+        uses: geekyeggo/delete-artifact@v5 # Updated to v5
         with:
             name: my-app-${{ matrix.os }}-${{ matrix.node }}
