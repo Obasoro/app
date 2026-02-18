@@ -37,7 +37,7 @@ jobs:
       with:
         path: ~/.npm
         key: ${{ runner.os }}-npm-${{ matrix.node }}-${{ hashFiles('**/package-lock.json') }}
-    - uses: actions/upload-artifact@v3
+    - uses: actions/upload-artifact@v4
       with:
         name: my-app-${{ matrix.os }}-${{ matrix.node }}
         path: dist/
