@@ -1,0 +1,525 @@
+name: CI/CD — Staging → Production
+
+# Flow:
+#   push DevOps-Test / staging
+#     → test + coverage + SAST
+#     → build (ECR) → deploy staging (SSM) → DAST
+#     → promote: open+merge PR into main (if staging green)
+#   push main
+#     → test + coverage + SAST
+#     → build (ECR) → deploy production (SSM) → DAST
+#
+# GitHub Environments (Variables only — no Secrets):
+#   staging    → us-east-1, SSM_PREFIX=/sali-idp-staging, …
+#   production → eu-north-1, SSM_PREFIX=/sali-idp, …
+# App secrets + private DB/Redis IPs live in Parameter Store.
+
+on:
+  push:
+    branches: [DevOps-Test, staging, main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Force deploy target (manual)'
+        type: choice
+        options: [staging, production]
+        default: staging
+      skip_promote:
+        description: 'Skip auto-merge staging → main'
+        type: boolean
+        default: false
+      confirm_production:
+        description: 'Required when targeting production — type DEPLOY'
+        type: string
+        default: ''
+
+concurrency:
+  group: idp-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  NODE_VERSION: '22'
+  # Coverage floors (must match package.json jest.coverageThreshold)
+  COVERAGE_LINES_MIN: '50'
+  COVERAGE_STATEMENTS_MIN: '50'
+  COVERAGE_FUNCTIONS_MIN: '45'
+  COVERAGE_BRANCHES_MIN: '40'
+
+permissions:
+  contents: read
+
+jobs:
+  # -------------------------------------------------------------------------
+  meta:
+    name: Resolve environment
+    runs-on: ubuntu-latest
+    outputs:
+      target: ${{ steps.r.outputs.target }}
+      is_staging: ${{ steps.r.outputs.is_staging }}
+      is_production: ${{ steps.r.outputs.is_production }}
+      should_deploy: ${{ steps.r.outputs.should_deploy }}
+      should_promote: ${{ steps.r.outputs.should_promote }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - id: r
+        run: |
+          EVENT="${{ github.event_name }}"
+          REF="${{ github.ref_name }}"
+          MSG=$(git log -1 --pretty=%B)
+
+          if [ "$EVENT" = "workflow_dispatch" ]; then
+            TARGET="${{ inputs.environment }}"
+            if [ "$TARGET" = "production" ] && [ "${{ inputs.confirm_production }}" != "DEPLOY" ]; then
+              echo "Production manual deploy blocked: set confirm_production=DEPLOY"
+              DEPLOY=false
+            else
+              DEPLOY=true
+            fi
+            PROMOTE=false
+          elif [ "$EVENT" = "pull_request" ]; then
+            TARGET=staging
+            DEPLOY=false
+            PROMOTE=false
+          elif [ "$REF" = "main" ]; then
+            TARGET=production
+            # Only auto-deploy when this commit is a staging promote merge
+            if echo "$MSG" | grep -q '^ci(promote):'; then
+              DEPLOY=true
+            elif [ "${{ vars.ALLOW_DIRECT_PRODUCTION_DEPLOY }}" = "true" ]; then
+              echo "WARN: direct main deploy allowed by ALLOW_DIRECT_PRODUCTION_DEPLOY"
+              DEPLOY=true
+            else
+              echo "Production safeguard: skip deploy (not a staging promote)"
+              DEPLOY=false
+            fi
+            PROMOTE=false
+          else
+            TARGET=staging
+            DEPLOY=true
+            PROMOTE=true
+            if [ "${{ inputs.skip_promote }}" = "true" ]; then
+              PROMOTE=false
+            fi
+          fi
+
+          echo "target=$TARGET" >> "$GITHUB_OUTPUT"
+          echo "should_deploy=$DEPLOY" >> "$GITHUB_OUTPUT"
+          echo "should_promote=$PROMOTE" >> "$GITHUB_OUTPUT"
+          echo "is_staging=$([ "$TARGET" = staging ] && echo true || echo false)" >> "$GITHUB_OUTPUT"
+          echo "is_production=$([ "$TARGET" = production ] && echo true || echo false)" >> "$GITHUB_OUTPUT"
+          echo "Resolved target=$TARGET deploy=$DEPLOY promote=$PROMOTE"
+
+  # -------------------------------------------------------------------------
+  lint:
+    name: Lint (enforced)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+      - run: npm ci
+      # Fail on any ESLint error or warning — no auto-fix in CI
+      - run: npm run lint:ci
+
+  test:
+    name: Test
+    runs-on: ubuntu-latest
+    needs: lint
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+      - run: npm ci
+      - run: npm test -- --ci --maxWorkers=2
+
+  coverage:
+    name: Coverage (threshold enforced)
+    runs-on: ubuntu-latest
+    needs: lint
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+      - run: npm ci
+      # Jest fails the job if coverageThreshold in package.json is not met
+      - run: npm run test:ci
+      - name: Publish coverage summary
+        if: always()
+        run: |
+          if [ -f coverage/coverage-summary.json ]; then
+            node -e '
+              const s=require("./coverage/coverage-summary.json").total;
+              const row=(k)=>`${k}: ${s[k].pct}%`;
+              console.log(["Coverage", row("lines"), row("statements"), row("functions"), row("branches")].join("\n"));
+              const fail=[];
+              if(s.lines.pct < +process.env.COVERAGE_LINES_MIN) fail.push("lines");
+              if(s.statements.pct < +process.env.COVERAGE_STATEMENTS_MIN) fail.push("statements");
+              if(s.functions.pct < +process.env.COVERAGE_FUNCTIONS_MIN) fail.push("functions");
+              if(s.branches.pct < +process.env.COVERAGE_BRANCHES_MIN) fail.push("branches");
+              if(fail.length){ console.error("Below threshold:", fail.join(", ")); process.exit(1); }
+            '
+          else
+            echo "coverage-summary.json missing"
+            exit 1
+          fi
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: coverage-report
+          path: coverage/
+          retention-days: 30
+
+  sast-semgrep:
+    name: SAST (Semgrep)
+    runs-on: ubuntu-latest
+    needs: lint
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: semgrep/semgrep-action@v1
+        with:
+          config: >-
+            p/ci
+            p/typescript
+            p/nodejs
+            p/owasp-top-ten
+          generateSarif: true
+      - if: always()
+        uses: github/codeql-action/upload-sarif@v3
+        continue-on-error: true
+        with:
+          sarif_file: semgrep.sarif
+
+  sast-trivy:
+    name: SAST (Trivy)
+    runs-on: ubuntu-latest
+    needs: lint
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: aquasecurity/trivy-action@0.28.0
+        with:
+          scan-type: fs
+          scan-ref: .
+          severity: CRITICAL,HIGH
+          format: sarif
+          output: trivy-fs.sarif
+          # Fail the pipeline on CRITICAL/HIGH findings
+          exit-code: '1'
+      - if: always()
+        uses: github/codeql-action/upload-sarif@v3
+        continue-on-error: true
+        with:
+          sarif_file: trivy-fs.sarif
+
+  sast-codeql:
+    name: SAST (CodeQL)
+    runs-on: ubuntu-latest
+    needs: lint
+    # Soft-required: private repos without GitHub Advanced Security cannot upload/analyze
+    continue-on-error: true
+    permissions:
+      contents: read
+      security-events: write
+      actions: read
+    steps:
+      - uses: actions/checkout@v4
+      - uses: github/codeql-action/init@v3
+        with:
+          languages: javascript-typescript
+      - uses: github/codeql-action/autobuild@v3
+      - uses: github/codeql-action/analyze@v3
+
+  # Hard gate: nothing deploys unless lint, tests, coverage, and core SAST all pass
+  quality-gate:
+    name: Quality gate
+    runs-on: ubuntu-latest
+    needs: [lint, test, coverage, sast-semgrep, sast-trivy, sast-codeql]
+    if: always()
+    steps:
+      - name: Enforce lint, test, coverage, Semgrep, Trivy
+        run: |
+          echo "lint=${{ needs.lint.result }}"
+          echo "test=${{ needs.test.result }}"
+          echo "coverage=${{ needs.coverage.result }}"
+          echo "semgrep=${{ needs.sast-semgrep.result }}"
+          echo "trivy=${{ needs.sast-trivy.result }}"
+          echo "codeql=${{ needs.sast-codeql.result }} (advisory)"
+          for r in \
+            "${{ needs.lint.result }}" \
+            "${{ needs.test.result }}" \
+            "${{ needs.coverage.result }}" \
+            "${{ needs.sast-semgrep.result }}" \
+            "${{ needs.sast-trivy.result }}"; do
+            if [ "$r" != "success" ]; then
+              echo "Quality gate FAILED ($r)"
+              exit 1
+            fi
+          done
+          echo "Quality gate PASSED"
+
+  # -------------------------------------------------------------------------
+  build:
+    name: Build & push ECR
+    runs-on: ubuntu-latest
+    needs: [meta, quality-gate]
+    if: |
+      always() &&
+      needs.meta.outputs.should_deploy == 'true' &&
+      needs.quality-gate.result == 'success'
+    environment: ${{ needs.meta.outputs.target }}
+    permissions:
+      contents: read
+      id-token: write
+    outputs:
+      version: ${{ steps.meta.outputs.version }}
+      image: ${{ steps.meta.outputs.image }}
+    env:
+      AWS_REGION: ${{ vars.AWS_REGION }}
+      SSM_PREFIX: ${{ vars.SSM_PREFIX }}
+      ECR_REPOSITORY: ${{ vars.ECR_REPOSITORY || 'sali-idp-backend' }}
+      USE_ECR: ${{ vars.USE_ECR || 'true' }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Require Environment vars
+        run: |
+          test -n "${{ vars.AWS_ROLE_ARN }}" || { echo "Missing vars.AWS_ROLE_ARN"; exit 1; }
+          test -n "$AWS_REGION" || { echo "Missing vars.AWS_REGION"; exit 1; }
+          test -n "$SSM_PREFIX" || { echo "Missing vars.SSM_PREFIX"; exit 1; }
+
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - id: meta
+        run: |
+          VERSION="$(date +%Y%m%d%H%M%S)-${GITHUB_SHA::7}"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          if [ "$USE_ECR" != "true" ]; then
+            echo "image=" >> "$GITHUB_OUTPUT"
+            echo "USE_ECR=false — skip push; host will build"
+            exit 0
+          fi
+          REGISTRY=$(aws ssm get-parameter --name "${SSM_PREFIX}/ECR_REGISTRY" --query 'Parameter.Value' --output text)
+          REPO=$(aws ssm get-parameter --name "${SSM_PREFIX}/ECR_REPOSITORY" --query 'Parameter.Value' --output text 2>/dev/null || echo "$ECR_REPOSITORY")
+          echo "image=${REGISTRY}/${REPO}" >> "$GITHUB_OUTPUT"
+          echo "registry=$REGISTRY" >> "$GITHUB_OUTPUT"
+          echo "repository=$REPO" >> "$GITHUB_OUTPUT"
+
+      - if: env.USE_ECR == 'true'
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - if: env.USE_ECR == 'true'
+        uses: docker/setup-buildx-action@v3
+
+      - if: env.USE_ECR == 'true'
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: |
+            ${{ steps.meta.outputs.image }}:${{ steps.meta.outputs.version }}
+            ${{ steps.meta.outputs.image }}:latest
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - if: env.USE_ECR == 'true'
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          image-ref: ${{ steps.meta.outputs.image }}:${{ steps.meta.outputs.version }}
+          severity: CRITICAL,HIGH
+          format: table
+          exit-code: '0'
+
+      - name: Record image tag in Parameter Store (keeps previous for rollback)
+        if: env.USE_ECR == 'true'
+        run: |
+          PREV=$(aws ssm get-parameter --name "${SSM_PREFIX}/IMAGE_TAG" --query 'Parameter.Value' --output text 2>/dev/null || true)
+          if [ -n "$PREV" ] && [ "$PREV" != "None" ]; then
+            aws ssm put-parameter --name "${SSM_PREFIX}/IMAGE_TAG_PREVIOUS" --value "$PREV" --type String --overwrite
+          fi
+          aws ssm put-parameter --name "${SSM_PREFIX}/IMAGE_TAG" --value "${{ steps.meta.outputs.version }}" --type String --overwrite
+
+  # -------------------------------------------------------------------------
+  deploy:
+    name: Deploy (${{ needs.meta.outputs.target }})
+    runs-on: ubuntu-latest
+    needs: [meta, build]
+    if: needs.meta.outputs.should_deploy == 'true' && needs.build.result == 'success'
+    environment: ${{ needs.meta.outputs.target }}
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      AWS_REGION: ${{ vars.AWS_REGION }}
+      SSM_PREFIX: ${{ vars.SSM_PREFIX }}
+      APP_DIR: ${{ vars.APP_DIR || '/opt/sali-idp/app' }}
+      API_REPLICAS: ${{ vars.API_REPLICAS || '1' }}
+    steps:
+      - name: Production deploy safeguards
+        if: needs.meta.outputs.is_production == 'true'
+        run: |
+          set -euo pipefail
+          echo "Production deploy checks..."
+          # Optional kill-switch: set PRODUCTION_LOCK=true on the production Environment
+          if [ "${{ vars.PRODUCTION_LOCK }}" = "true" ]; then
+            echo "PRODUCTION_LOCK=true — refusing production deploy"
+            exit 1
+          fi
+          test -n "${{ vars.DAST_TARGET_URL }}" || {
+            echo "production requires vars.DAST_TARGET_URL for post-deploy DAST"
+            exit 1
+          }
+          echo "Production safeguards OK"
+
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Deploy via SSM (single or multi-instance)
+        env:
+          VERSION: ${{ needs.build.outputs.version }}
+          GIT_SHA: ${{ github.sha }}
+          # Comma-separated for future multi-server workload share
+          INSTANCE_IDS: ${{ vars.EC2_INSTANCE_IDS || vars.EC2_INSTANCE_ID }}
+          # Optional weights e.g. "70,30" — stored in SSM later; passed for logging
+          INSTANCE_WEIGHTS: ${{ vars.INSTANCE_WEIGHTS || '100' }}
+        run: |
+          set -euo pipefail
+          test -n "${INSTANCE_IDS}" || { echo "Set vars.EC2_INSTANCE_ID or EC2_INSTANCE_IDS"; exit 1; }
+
+          IFS=',' read -ra IDS <<< "$INSTANCE_IDS"
+          IFS=',' read -ra WEIGHTS <<< "$INSTANCE_WEIGHTS"
+          echo "Deploying version=$VERSION to ${#IDS[@]} instance(s); weights=${INSTANCE_WEIGHTS}"
+
+          REMOTE_SCRIPT=$(cat <<EOF
+          set -euo pipefail
+          cd '${APP_DIR}'
+          git fetch --all --prune
+          git checkout '${GIT_SHA}'
+          chmod +x deploy.sh
+          export AWS_REGION='${AWS_REGION}'
+          export SSM_PREFIX='${SSM_PREFIX}'
+          export VERSION='${VERSION}'
+          export APP_DIR='${APP_DIR}'
+          export DEPLOY_DIR=/opt/sali-idp
+          export API_REPLICAS='${API_REPLICAS}'
+          export DEPLOY_MODE=deploy
+          ./deploy.sh
+          EOF
+          )
+          PARAMS=$(jq -n --arg s "$REMOTE_SCRIPT" '{commands:[$s]}')
+
+          FAILED=0
+          for i in "${!IDS[@]}"; do
+            ID="$(echo "${IDS[$i]}" | xargs)"
+            W="${WEIGHTS[$i]:-n/a}"
+            echo "=== SSM → $ID (weight=${W}%) ==="
+            COMMAND_ID=$(aws ssm send-command \
+              --instance-ids "$ID" \
+              --document-name "AWS-RunShellScript" \
+              --comment "Deploy sali-idp ${VERSION} (${{ needs.meta.outputs.target }}) weight=${W}" \
+              --parameters "$PARAMS" \
+              --timeout-seconds 1800 \
+              --query 'Command.CommandId' --output text)
+
+            for _ in $(seq 1 90); do
+              STATUS=$(aws ssm get-command-invocation \
+                --command-id "$COMMAND_ID" --instance-id "$ID" \
+                --query 'Status' --output text 2>/dev/null || echo Pending)
+              echo "$ID status: $STATUS"
+              case "$STATUS" in
+                Success) break ;;
+                Failed|Cancelled|TimedOut)
+                  aws ssm get-command-invocation \
+                    --command-id "$COMMAND_ID" --instance-id "$ID" \
+                    --query '{Status:Status,Stdout:StandardOutputContent,Stderr:StandardErrorContent}' \
+                    --output json
+                  FAILED=1
+                  break
+                  ;;
+                *) sleep 10 ;;
+              esac
+            done
+          done
+          exit $FAILED
+
+  # -------------------------------------------------------------------------
+  dast:
+    name: DAST (OWASP ZAP)
+    runs-on: ubuntu-latest
+    needs: [meta, deploy]
+    if: needs.deploy.result == 'success'
+    environment: ${{ needs.meta.outputs.target }}
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      - name: ZAP baseline
+        uses: zaproxy/action-baseline@v0.14.0
+        with:
+          target: ${{ vars.DAST_TARGET_URL }}
+          cmd_options: '-a'
+          allow_issue_writing: false
+          fail_action: true
+      - if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: zap-report-${{ needs.meta.outputs.target }}
+          path: report_html.html
+          if-no-files-found: ignore
+          retention-days: 30
+
+  # -------------------------------------------------------------------------
+  # Staging green → merge into main (triggers production deploy)
+  # -------------------------------------------------------------------------
+  promote:
+    name: Promote staging → main
+    runs-on: ubuntu-latest
+    needs: [meta, quality-gate, dast]
+    if: |
+      always() &&
+      needs.meta.outputs.should_promote == 'true' &&
+      needs.quality-gate.result == 'success' &&
+      needs.dast.result == 'success'
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ vars.PROMOTION_GITHUB_TOKEN || github.token }}
+
+      - name: Merge staging branch into main
+        env:
+          GH_TOKEN: ${{ vars.PROMOTION_GITHUB_TOKEN || github.token }}
+          SOURCE: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git fetch origin main
+          git checkout -B main origin/main
+          git merge --no-ff "origin/${SOURCE}" -m "ci(promote): merge ${SOURCE} into main after staging passed"
+          git push origin main
+          echo "Promoted ${SOURCE} → main (production pipeline will run on promote commit only)"
